@@ -118,7 +118,7 @@
 // PIN Definitions:  Input and Outputs
 //
 #define PLAY_VOICE_IN  21          // Send the Voice ID, Play on Voice Bd
-#define PLAY_CW_IN     23          // Send a CW ID from the Teensy
+#define PLAY_CW_IN     03          // Send a CW ID from the Teensy
 #define ERASE_IN       20          // Erase the Voice ID, Erase on Voice Bd
 #define RECORD_IN      19          // Record New Voice ID, Record on Voice Bd
 #define MODE_IN         0          // Toggle switch for CW only or CW & Voice ID
@@ -140,7 +140,8 @@
 //
 #define CW_AUDIO       22          // PWM Teensy output of CW Audio tone
 #define PTT_OUT        04          // PTT to Repeater, Active Low
-#define COS_IN         03          // Carrier Detect Input
+#define COS_IN         23          // Carrier Detect Input
+#define INT_RDY        02          // INT/RDY signal, active Low from Voice Chip
 //
 //
 // 
@@ -178,11 +179,17 @@
 // All delays are in ms
 //
 #define RECORDING_DELAY 5000      // Record for 5s
-//#define RECORDING_DELAY 8000      // Record for 8s
 #define ERASE_DELAY     10000     // Erase for 10s
-#define VOICEID_DELAY   7000      // 7s for voice id to play
+#define VOICEID_DELAY   5000      // 5s for voice id to play
 #define PTT_DELAY       750       // 1.5s PTT delay 
 #define COS_DELAY       100       // delay 100ms between consecutive COS ADC reads
+#define PWRUP_DELAY     10000     // Time for Westel Diagnostics to complete
+#define RDY_DELAY       4       // 2s max ??
+#define PLAY_DELAY      1000
+//
+// Carrier Detection Level - Pseudo Carrier Operated Squelch Threshold
+//
+#define COS_LEVEL       10        // If COS measured above this, we have activity on repeater
 //
 #define LED_OFF      LOW
 #define LED_ON      HIGH
@@ -201,7 +208,8 @@
 
 // transmission speed (in words per minute)
 #ifdef HAM_MODE
-#define speedWPM 25
+#define speedWPM 30
+//#define speedWPM 18
 #else
 #define speedWPM 18
 #endif
@@ -236,6 +244,7 @@ int activity_timer;
 int last_id;
 
 int cos_in;
+int rValue;
 
 boolean last_ptt;
 boolean last_cos;
@@ -258,8 +267,9 @@ char dState[8][16] =
 //
 //////////////////////////////////////////////////////////////////////////////////////////////
 
-char const msgVoice[] = "DE ARES/RACES 147.290 MHZ MINGUS";
-char const msg[] = "DE K7YCA";
+char const msgVoice[] = "DE ARES/RACES 147.290 MHZ MINGUS ";
+char const msg[] = "K7YCA/R";
+//char const msg[] = "DE NO1D TESTING WESTEL REPEATER FOR MINGUS MOUNTAIN";
 char const msgTimeout[] = "TIMEOUT";
 
 //
@@ -429,27 +439,24 @@ void sendCWID(const char* msg)
 // transmits Voice ID via external board
 void sendVoiceID()
 {
-  digitalWrite(PTT_OUT, LOW);
+  int rdelay = 0;
+
+  // Turn on PTT LED
   digitalWrite(LED_PTT, LED_ON);
-
+  // Key repeater
+  digitalWrite(PTT_OUT, LOW);
+  // delay a tad before starting ID
   delay(PTT_DELAY);
-
+  // Activate Play button
   digitalWrite(PLAY_OUT, LOW);
+  // Turn on VOice ID LED
   digitalWrite(LED_VOICEID, LED_ON);
-
-  // TODO: Ideally we want program to continue while output is low
-  //       as believe voice play stops when we toggle back high
-
+  // Delay for Voice ID to play
   delay(VOICEID_DELAY);
-  
+  // Turn off Play button
   digitalWrite(PLAY_OUT, HIGH);
+  // Turn off VOICEID LED
   digitalWrite(LED_VOICEID, LED_OFF);
-
-  delay(PTT_DELAY);
-
-  // turn off PTT at the end
-  digitalWrite(PTT_OUT, HIGH);
-  digitalWrite(LED_PTT, LED_OFF);
 }
 
 //
@@ -467,8 +474,13 @@ void resetVoiceBd()
 //
 void eraseVoice()
 {
+  // Start Erase cycle
   digitalWrite(ERASE_OUT, LOW);
+
+  // Delay long enough to completely erase NVRAM
   delay(ERASE_DELAY);
+
+  // Stop Erase Cycle
   digitalWrite(ERASE_OUT, HIGH);
 }
 
@@ -477,17 +489,23 @@ void eraseVoice()
 //
 void recordVoiceID()
 {
-  // Enable recording for max of 7 seconds
-  digitalWrite(LED_RECORDING, LED_ON);
-  digitalWrite(RECORD_OUT, LOW);
+
 #ifdef DEBUG_VOICE
   sendCWID(msgVoice);
 #endif  
+
+  // Start recording 
+  digitalWrite(LED_RECORDING, LED_ON);
+  digitalWrite(RECORD_OUT, LOW);
+
+  // Fixed delay time
   delay(RECORDING_DELAY);
 
+  // Stop Recording
   digitalWrite(RECORD_OUT, HIGH);
   digitalWrite(LED_RECORDING, LED_OFF);
 
+  Serial.print("Voice ID Recorded\n");
 }
 
 //
@@ -495,17 +513,10 @@ void recordVoiceID()
 //
 boolean readCOS()
 {
-  int rValue = 0;
-
-  rValue = analogRead(COS_IN);
-  delay(COS_DELAY);
-  rValue += analogRead(COS_IN);
-
-  rValue = rValue/2;
-  
-  if (rValue > 30) return HIGH;
-
-  return LOW;
+  if (analogRead(COS_IN) > COS_LEVEL)
+    return HIGH;
+  else
+    return LOW;
 }
 
 //
@@ -589,7 +600,7 @@ void setup()
   int x = 0;
   int value = 0;
   
-  // Initilize Pins
+  // Initilize Input Pins
   //
   pinMode(PTT_IN, INPUT_PULLUP);
   pinMode(PLAY_VOICE_IN, INPUT_PULLUP);
@@ -597,12 +608,16 @@ void setup()
   pinMode(ERASE_IN, INPUT_PULLUP);
   pinMode(RECORD_IN, INPUT_PULLUP);
   pinMode(MODE_IN, INPUT_PULLUP);
-
+  // INT/RDY has external pullup resistor
+  pinMode(INT_RDY, INPUT_PULLUP);
+  // Analog ADC input for pseudo COS detection
   analogReference(DEFAULT);
   for (x = 0; x < 100; x++) {
     value += analogRead(COS_IN);
   }
-  
+
+  // Initialize Output Pins
+  //
   pinMode(LED_INIT, OUTPUT);
   pinMode(LED_HEARTBEAT, OUTPUT);
   pinMode(LED_PTT, OUTPUT);
@@ -610,17 +625,14 @@ void setup()
   pinMode(LED_CWID, OUTPUT);
   pinMode(LED_VOICEID, OUTPUT);
   pinMode(LED_RECORDING, OUTPUT);
-
-  // pinMode(CW_AUDIO, ????);
-
   pinMode(PTT_OUT, OUTPUT);
   pinMode(PLAY_OUT, OUTPUT);
   pinMode(RECORD_OUT, OUTPUT);
   pinMode(ERASE_OUT, OUTPUT);
   //  pinMode(RESET_OUT, OUTPUT);
   
-
   // preset digital outputs
+  //
   digitalWrite(PTT_OUT, HIGH);
   digitalWrite(PLAY_OUT, HIGH);
   digitalWrite(RECORD_OUT, HIGH);
@@ -677,7 +689,7 @@ void setup()
   digitalWrite(LED_VOICEID, LED_OFF);
   digitalWrite(LED_RECORDING, LED_OFF);
 
-  delay(1000);
+  delay(PWRUP_DELAY);
 
   // Leave this LED on at end of INIT function
   digitalWrite(LED_INIT, LED_ON);
@@ -710,6 +722,13 @@ void setup()
 void loop() 
 {
 
+  //      while (true) {
+  //	sendCWID(msg);
+  //	delay(5000);
+  //	sendVoiceID();
+  //	delay(5000);
+  //      }
+  
   // Read Inputs
   readInputs();
   
@@ -849,7 +868,7 @@ void loop()
   delay(400);
 
 
-  Serial.printf("DEBUG: last state: %s, new state: %s, cwtmr=%d, atmr=%d, vtmr=%d, last_id: %d, mode: %d\n", dState[last_state], dState[state], cw_timer, activity_timer, voice_timer, last_id, mode);
+  Serial.printf("DEBUG: last state: %s, new state: %s, cwtmr=%d, atmr=%d, vtmr=%d, last_id: %d, mode: %d, cos: %d\n", dState[last_state], dState[state], cw_timer, activity_timer, voice_timer, last_id, mode, rValue);
 }
 
 #else
