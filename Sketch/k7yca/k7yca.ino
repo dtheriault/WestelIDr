@@ -1,14 +1,16 @@
 //
-// File: TeensyRptrCtrlr.ino
+// File: k7yca.ino
 //
 // Author:  NO1D - Doug Theriault
-// Dated:   20170713
+// Dated:   20170810
 //
 // Description:
 //
 // This sketch is a very basic/simple repeater ID controller which was developed
-// for WB7NFX.  The interface is to a Westel DRB25 VHF repeater however this
-// software is generic and can be modified to fit other requirements.
+// for K7YCA ARES/RACES team.
+//
+// The interface is to a Westel DRB25 VHF repeater however this software is generic
+// and can be modified to fit other requirements.
 //
 // The software handles button presses to activate CW ID, Voice ID and record
 // and erase functions and mode switch.  In addition it outputs series of 7 LEDs
@@ -39,33 +41,48 @@
 //
 // Hardware:
 //
-// Schematic for simple 3-channel audio mixer, 3-transistor audio amp, Teensy I/O
-// LED's etc are available on github.
+// Repeater controller is based on a Teensy3.2 chipset; other avr like chips can be
+// used with changes to the software sketch and hardware design.
 //
-// Voice ID is handled by external board similar to:
+// Schematic for simple 3-channel audio mixer, 3-transistor audio amp, Teensy I/O
+// LED's etc are available in the github repository.
+//
+// Voice ID is handled by an on board chip vs. an external voice recorder board that
+// was used in earlier version for WB7NFX.  Basis for integrating voice ID recorder
+// is from hardware design:
+//
 //   https://ludens.cl/Electron/voiceID/voiceID.html
+//
+// GitHub repository contains the eagle files for schematic/board layout, Gerbers if
+// you want to produce your own and mechanical faceplate design for the Westel repeater
+// by Rob KG7LMI.
+//
+// The git repo also contains sketch files for various versions of the controller; the
+// one listed for our ARES/RACES team, K7YCA is the current latest rev that supports
+// the hardware design in the eagle files.  Feel free to modify the software as required
+// for your purposes.
 //
 // Contact info:
 //
 // email:  no1d.doug@gmail.com
-// repository:  https://github.com/dtheriault/TeensyRptrCtrlr
+// repository:  https://github.com/dtheriault/WestelIDr
 //
 // License:
 //
 // Copyright (C) 2017 Douglas Theriault - NO1D
 //
-// TeensyRptrCtrlr.ino is free software: you can redistribute it and/or modify
+// Software is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// TeensyRptrCtrlr.ino is distributed in the hope that it will be useful,
+// This is distributed in the hope that it will be useful to someone or ham club/group,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 // or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
 // more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with IDtimer.ino.  If not, see <http://www.gnu.org/licenses/>.
+// in the repository.  If not, see <http://www.gnu.org/licenses/>.
 //			      
 //
 ////////////////////////////////////////////////
@@ -169,10 +186,12 @@
 #define CW_TIMEOUT    600         // Play CW ID every 10m after COS or PTT go active
 #define VOICE_TIMEOUT 600         // Play Voice ID every 10m after COS or PTT go active
 #define COS_TIMEOUT   300         // COS/PTT 5m timeout
+#define MAX_TIMEOUT   1200        // 2x largest timeout to prevent wrapping of counter
 #else
 #define CW_TIMEOUT    600         // Play CW ID every 10m after COS or PTT go active
 #define VOICE_TIMEOUT 1800        // Play Voice ID every 30m when IDLE
 #define COS_TIMEOUT   180         // COS/PTT 3m timeout
+#define MAX_TIMEOUT   3600        // 2x largest timeout to prevent wrapping of counter
 #endif
 
 //
@@ -206,12 +225,11 @@
 // delay before repeating the message (in Ms)
 #define repeatDelayMs 300000
 
-// transmission speed (in words per minute)
+// transmission speed (in words per minute); max speed ham mode should be 20wpm per part 97 rule
 #ifdef HAM_MODE
-#define speedWPM 30
-//#define speedWPM 18
+#define speedWPM 20
 #else
-#define speedWPM 18
+#define speedWPM 30
 #endif
 
 // element duration is according to Farnsworth Technique
@@ -269,7 +287,6 @@ char dState[8][16] =
 
 char const msgVoice[] = "DE ARES/RACES 147.290 MHZ MINGUS ";
 char const msg[] = "K7YCA/R";
-//char const msg[] = "DE NO1D TESTING WESTEL REPEATER FOR MINGUS MOUNTAIN";
 char const msgTimeout[] = "TIMEOUT";
 
 //
@@ -439,8 +456,6 @@ void sendCWID(const char* msg)
 // transmits Voice ID via external board
 void sendVoiceID()
 {
-  int rdelay = 0;
-
   // Turn on PTT LED
   digitalWrite(LED_PTT, LED_ON);
   // Key repeater
@@ -524,7 +539,6 @@ boolean readCOS()
 //
 void readInputs()
 {
-
   mic_ptt = digitalRead(PTT_IN);
   play_voice = digitalRead(PLAY_VOICE_IN);
   play_cw = digitalRead(PLAY_CW_IN);
@@ -533,6 +547,7 @@ void readInputs()
   mode = digitalRead(MODE_IN);
 
   cos_in = readCOS();
+  
 }
 
 
@@ -698,9 +713,6 @@ void setup()
 }
 
 
-#ifdef HAM_MODE
-
-
 // Main Repeater Controller Loop
 //
 // Description:
@@ -715,20 +727,35 @@ void setup()
 // Note:  Currently the CW Id is burned into the code.  User must keep the
 //        voice ID same as CW Id.
 //
-// See the design document for schematic and details on operational control.
+// INIT:  Sends either VoiceID or CWID depending upon mode first time after
+//        power up.
 //
-
-
+// IDLE:  In IDLE state, repeater is not active.  We monitor for local mic PTT
+//        and if carrier detect is triggered on repeater.  If either are active,
+//        and time since last ID is > than either CW or Voice Timeouts, we ID
+//        else we enter Timing CW or Voice states and adjust timeout value based
+//        upon when last time we ID'd.
+//
+// ID_FIRST:  In this state we wait until PTT has been released or repeater has
+//        become in-active then send our ID.  Depending upon mode set we then
+//        enter either Voice or CW ID mode.
+//
+// RPTR_ACTIVE:  This state keeps track when the repeater is active and makes
+//        sure that it is not active longer than 'n' minutes.  If it is, then
+//        the repeater sends CW message (timeout) indicating activity timer has
+//        been exceeded.
+//
+// TIMING_CW:  When repeater is not active, keeps track of CW Timeout.
+//
+// TIMING_VOICE:  When repeater is not active, keeps track of Voice Timeout
+//
+// CWID:  Sends CW ID and returns to IDLE state
+//
+// VOICE_ID:  Sends Voice ID and returns to IDLE state
+//
+//
 void loop() 
 {
-
-  //      while (true) {
-  //	sendCWID(msg);
-  //	delay(5000);
-  //	sendVoiceID();
-  //	delay(5000);
-  //      }
-  
   // Read Inputs
   readInputs();
   
@@ -748,6 +775,11 @@ void loop()
       break;
 	
     case IDLE:
+      // This counter keeps track of last time we ID'd
+      ++last_id;
+      // make sure last_id counter does not wrap
+      if (last_id > MAX_TIMEOUT) last_id = MAX_TIMEOUT;
+      
       last_state = IDLE;
       // reset timeout counters
       cw_timer = CW_TIMEOUT;
@@ -755,7 +787,34 @@ void loop()
       activity_timer = COS_TIMEOUT;
       // stay here until we detect repeater has gone active
       if ((mic_ptt == LOW) || (cos_in == HIGH)) {
-	state = ID_FIRST;
+	// if we are in CW ID only mode
+	if (mode == MODE_CWID) {
+	  // and our last ID was within the 10m period
+	  if (last_id < CW_TIMEOUT) {
+	    // re-enter the TIMING CW mode 
+	    state = TIMING_CW;
+	    // set CW Timeout period equal to last id time remaining
+	    cw_timer = (CW_TIMEOUT - last_id);
+	  }
+	  else {
+	    // we have been idle > 10m interval
+	    state = ID_FIRST;
+	  }
+	}
+	// if we're in VOICE ID mode
+	else if (mode == MODE_VID) {
+	  // and our last ID was within the 30m period
+	  if (last_id < VOICE_TIMEOUT) {
+	    // re-enter the TIMING Voice mode 
+	    state = TIMING_VOICE;
+	    // set Voice Timeout period equal to last id time remaining
+	    voice_timer = (VOICE_TIMEOUT - last_id);
+	  }
+	  else {
+	    // we have been idle > 30m interval
+	    state = ID_FIRST;
+	  }
+	}
       }
       break;
 
@@ -791,7 +850,6 @@ void loop()
 	else {
 	  state = TIMING_VOICE;
 	}
-	
 	activity_timer = COS_TIMEOUT;
       }
       else {
@@ -844,6 +902,7 @@ void loop()
     case VOICEID:
       last_state = VOICEID;
       sendVoiceID();
+      last_id = 0;
       state = IDLE;
       break;
 
@@ -851,187 +910,19 @@ void loop()
       break;
     }
 
-  // This counter keeps track of last time we ID'd
-  ++last_id;
-  
   //
   // Blinky Heartbeat LED
   //
   digitalWrite(LED_HEARTBEAT, LED_ON);
-
   // wait and repeat
   delay(500);
-  
+  //
   digitalWrite(LED_HEARTBEAT, LED_OFF);
 
-  // wait and repeat
+  // wait and repeat; note: budget of 100ms for state machine to run and debug printf to execute; might have to tweak.
   delay(400);
 
-
-  Serial.printf("DEBUG: last state: %s, new state: %s, cwtmr=%d, atmr=%d, vtmr=%d, last_id: %d, mode: %d, cos: %d\n", dState[last_state], dState[state], cw_timer, activity_timer, voice_timer, last_id, mode, rValue);
+  // Just a debug statement
+  Serial.printf("DEBUG: last state: %s, new state: %s, cwtmr=%d, atmr=%d, vtmr=%d, last_id: %d, mode: %d, cos: %d, mic_ptt: %d\n", dState[last_state], dState[state], cw_timer, activity_timer, voice_timer, last_id, mode, rValue, mic_ptt);
 }
 
-#else
-
-// Main Repeater Controller Loop
-//
-// Description:
-//
-// This routine will loop endlessely executing a simple state machine
-// that performs necessary ID'ng of the 2m repeater for Part 97 rules.
-// When the repeater is idle, every 30m the repeater will key a voice ID
-// board to play a Voice ID message.  If from IDLE, the repeater generates
-// transmission, Carrier Detect is determined at which time an ID will be 
-// sent when PTT is non-active.  Then, 10m later a CW Id will be sent.
-//
-// The routine calls series of functions to read input from some switches,
-// from the PTT and Monitor lines to perform specific actions such as 
-// recording a message, playing a Voice or CW Id or erasing a Voice ID.
-//
-// Note:  Currently the CW Id is burned into the code.  User must keep the
-//        voice ID same as CW Id.
-//
-// See the design document for schematic and details on operational control.
-//
-
-void loop() 
-{
-
-  // Read Inputs
-  readInputs();
-  
-  // Execute FrontPanel commands
-  execCommands();
-
-  // Execute State Machine
-  switch (state)
-    {
-    case INIT:
-      // Force CWID
-      sendCWID(msg);
-      if (mode == MODE_VID)
-	sendVoiceID();
-      last_id = 0;
-      state = IDLE;
-      break;
-	
-    case IDLE:
-      last_state = IDLE;
-      // reset timeout counters
-      cw_timer = CW_TIMEOUT;
-      voice_timer = VOICE_TIMEOUT;
-      activity_timer = COS_TIMEOUT;
-      // stay here until we detect repeater has gone active
-      if ((mic_ptt == LOW) || (cos_in == HIGH)) {
-	state = ID_FIRST;
-      }
-      else {
-	// We stay in the IDLE state if we're to ID CW Only
-	// otherwise, we start the 30m Voice ID 
-	if (mode == MODE_CWID) {
-	  state = IDLE;
-	}
-	else {
-	  state = TIMING_VOICE;
-	}
-      }
-      break;
-
-    case ID_FIRST:
-      last_state = ID_FIRST;
-      if ((mic_ptt == HIGH) && (cos_in == LOW)) {
-	sendCWID(msg);
-	activity_timer = COS_TIMEOUT;
-	state = TIMING_CW;
-	last_id = 0;
-      }
-      else if (--activity_timer <= 0) {
-	sendCWID(msgTimeout);
-	sendCWID(msg);
-	activity_timer = COS_TIMEOUT;
-	state = RPTR_ACTIVE;
-	last_id = 0;
-      }
-      break;
-      
-
-    case RPTR_ACTIVE:
-      last_state = RPTR_ACTIVE;
-      if ((mic_ptt == HIGH) && (cos_in == LOW))	{
-	state = TIMING_CW;
-	activity_timer = COS_TIMEOUT;
-      }
-      else {
-	if (--activity_timer <= 0) {
-	  sendCWID(msgTimeout);
-	  activity_timer = COS_TIMEOUT;
-	}
-	if (--cw_timer == 0) {
-	  state = CWID;
-	}
-      }
-      break;
-
-    case TIMING_CW:
-      last_state = TIMING_CW;
-      if (--cw_timer <= 0)
-	state = CWID;
-      else if ((mic_ptt == LOW) || (cos_in == HIGH)) {
-	state = RPTR_ACTIVE;
-	activity_timer = COS_TIMEOUT;
-      }
-      break;
-
-      case TIMING_VOICE:
-      last_state = TIMING_VOICE;
-      // if we've timed out, immediately send appropriate ID
-      if (--voice_timer <= 0) {
-	if (mode == MODE_VID)
-	  state = VOICEID;
-	else
-	  state = IDLE;
-      }
-      // Check to see if Repeater has gone active
-      else if ((mic_ptt == LOW) || (cos_in == HIGH)) {
-	  state = ID_FIRST;
-      }
-      break;
-
-    case CWID:
-      last_state = CWID;
-      sendCWID(msg);
-      last_id = 0;
-      state = IDLE;
-      break;
-
-    case VOICEID:
-      last_state = VOICEID;
-      sendVoiceID();
-      state = IDLE;
-      break;
-
-    default:
-      break;
-    }
-
-  // This counter keeps track of last time we ID'd
-  ++last_id;
-  
-  //
-  // Blinky Heartbeat LED
-  //
-  digitalWrite(LED_HEARTBEAT, LED_ON);
-
-  // wait and repeat
-  delay(500);
-  
-  digitalWrite(LED_HEARTBEAT, LED_OFF);
-
-  // wait and repeat
-  delay(400);
-
-
-  Serial.printf("DEBUG: last state: %s, new state: %s, cwtmr=%d, atmr=%d, vtmr=%d, last_id: %d, mode: %d\n", dState[last_state], dState[state], cw_timer, activity_timer, voice_timer, last_id, mode);
-}
-
-#endif
